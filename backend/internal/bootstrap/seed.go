@@ -7,12 +7,16 @@ import (
 
 	"gorm.io/gorm"
 
+	"streetlight/internal/modules/dispatch"
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
 )
 
-const hour = time.Hour
+const (
+	hour   = time.Hour
+	minute = time.Minute
+)
 
 // seedRepairCase 描述一条演示维修记录, 时间字段为距当前时刻的时长。
 type seedRepairCase struct {
@@ -40,8 +44,22 @@ type seedFaultCase struct {
 	repairs     []seedRepairCase
 }
 
+// seedDispatchCase 描述一条演示派工记录, 时间字段为距当前时刻的时长。
+type seedDispatchCase struct {
+	faultIndex     int
+	teamName       string
+	dispatchedAgo  time.Duration
+	finishedAgo    time.Duration // 为 0 表示仍在办
+	reassignReason string        // 非空表示该记录已被改派转出, 下一条记录为接收班组
+}
+
 // seed 在数据库为空时写入演示数据, 便于启动后立即体验完整业务流程。
 func seed(db *gorm.DB) error {
+	// 班组属于主数据, 独立播种, 保证已有台账数据的库也能使用派工功能。
+	if err := seedTeams(db); err != nil {
+		return err
+	}
+
 	var count int64
 	if err := db.Model(&lamp.Lamp{}).Count(&count).Error; err != nil {
 		return err
@@ -146,12 +164,134 @@ func seed(db *gorm.DB) error {
 		return err
 	}
 
+	dispatchCount, err := seedDispatches(db, now, faults)
+	if err != nil {
+		return err
+	}
+
 	slog.Info("演示数据初始化完成",
 		"路灯", len(lamps),
 		"故障", len(faults),
 		"维修记录", len(repairs),
+		"派工单", dispatchCount,
 	)
 	return nil
+}
+
+// seedTeams 在班组表为空时写入演示班组: 覆盖不同故障类型与负责区域的组合。
+func seedTeams(db *gorm.DB) error {
+	var count int64
+	if err := db.Model(&dispatch.Team{}).Count(&count).Error; err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+
+	lampTypes := []string{"灯不亮", "灯光闪烁", "灯具常亮", "灯具破损", "其他"}
+	teams := []dispatch.Team{
+		{Name: "市政照明一班", Leader: "王建国", Phone: "13800000001", MemberCount: 6, Enabled: true, Remark: "城东区灯具类故障"},
+		{Name: "市政照明二班", Leader: "周涛", Phone: "13800000002", MemberCount: 5, Enabled: true, Remark: "城西区灯具类故障"},
+		{Name: "线路抢修班", Leader: "赵强", Phone: "13800000003", MemberCount: 4, Enabled: true, Remark: "线路与控制箱故障, 不限区域"},
+		{Name: "综合应急班", Leader: "陈鹏", Phone: "13800000004", MemberCount: 3, Enabled: true, Remark: "不限故障类型与区域, 兜底应急"},
+	}
+	teams[0].SetTypes(lampTypes)
+	teams[0].SetRoads([]string{"中山路", "建设大道", "园区北路"})
+	teams[1].SetTypes(lampTypes)
+	teams[1].SetRoads([]string{"滨江路", "解放路", "学院路"})
+	teams[2].SetTypes([]string{"线路故障", "控制箱故障"})
+
+	if err := db.Create(&teams).Error; err != nil {
+		return fmt.Errorf("写入班组演示数据失败: %w", err)
+	}
+	return nil
+}
+
+// seedDispatches 依据演示故障写入派工记录, 覆盖在办 / 已完工 / 改派双记录 / 超时未完工场景。
+func seedDispatches(db *gorm.DB, now time.Time, faults []fault.Fault) (int, error) {
+	teams := make([]dispatch.Team, 0)
+	if err := db.Find(&teams).Error; err != nil {
+		return 0, fmt.Errorf("读取班组演示数据失败: %w", err)
+	}
+	teamByName := make(map[string]dispatch.Team, len(teams))
+	for _, team := range teams {
+		teamByName[team.Name] = team
+	}
+
+	cases := []seedDispatchCase{
+		// 待处理故障: 一班在办超过 24 小时未完工, 用于演示超时统计
+		{faultIndex: 1, teamName: "市政照明一班", dispatchedAgo: 28 * hour},
+		// 维修中故障: 在办派工
+		{faultIndex: 3, teamName: "线路抢修班", dispatchedAgo: 150 * minute},
+		{faultIndex: 4, teamName: "综合应急班", dispatchedAgo: 4 * hour},
+		// 已修复 / 已关闭故障: 已完工派工
+		{faultIndex: 5, teamName: "市政照明一班", dispatchedAgo: 1530 * minute, finishedAgo: 20 * hour},
+		{faultIndex: 6, teamName: "市政照明一班", dispatchedAgo: 2910 * minute, finishedAgo: 44 * hour},
+		{faultIndex: 7, teamName: "综合应急班", dispatchedAgo: 71 * hour, finishedAgo: 60 * hour},
+		{faultIndex: 8, teamName: "市政照明一班", dispatchedAgo: 95 * hour, finishedAgo: 90 * hour},
+		{faultIndex: 9, teamName: "市政照明一班", dispatchedAgo: 119 * hour, finishedAgo: 112 * hour},
+		{faultIndex: 10, teamName: "线路抢修班", dispatchedAgo: 149 * hour, finishedAgo: 120 * hour},
+		{faultIndex: 11, teamName: "市政照明一班", dispatchedAgo: 570 * minute, finishedAgo: 7 * hour},
+		// 改派演示: 先派综合应急班, 因专业原因改派线路抢修班, 两个班组各留一条记录
+		{faultIndex: 13, teamName: "综合应急班", dispatchedAgo: 14 * hour, finishedAgo: 13 * hour, reassignReason: "控制箱故障属线路抢修班专长, 改派专业班组承接"},
+		{faultIndex: 13, teamName: "线路抢修班", dispatchedAgo: 13 * hour},
+	}
+
+	records := make([]dispatch.Dispatch, 0, len(cases))
+	sequences := map[string]int{}
+	for _, item := range cases {
+		target := faults[item.faultIndex]
+		team := teamByName[item.teamName]
+		dispatchedAt := now.Add(-item.dispatchedAgo)
+		prefix := "PG" + dispatchedAt.Format("20060102")
+		sequences[prefix]++
+
+		record := dispatch.Dispatch{
+			DispatchNo:   fmt.Sprintf("%s%04d", prefix, sequences[prefix]),
+			FaultID:      target.ID,
+			FaultNo:      target.FaultNo,
+			LampID:       target.LampID,
+			LampCode:     target.LampCode,
+			RoadName:     target.RoadName,
+			FaultType:    target.FaultType,
+			TeamID:       team.ID,
+			TeamName:     team.Name,
+			Status:       dispatch.StatusOngoing,
+			Operator:     "调度员",
+			DispatchedAt: dispatchedAt,
+		}
+		switch {
+		case item.reassignReason != "":
+			record.Status = dispatch.StatusReassigned
+			record.ReassignReason = item.reassignReason
+			finishedAt := now.Add(-item.finishedAgo)
+			record.FinishedAt = &finishedAt
+		case item.finishedAgo > 0:
+			record.Status = dispatch.StatusDone
+			finishedAt := now.Add(-item.finishedAgo)
+			record.FinishedAt = &finishedAt
+		}
+		records = append(records, record)
+	}
+	if err := db.Create(&records).Error; err != nil {
+		return 0, fmt.Errorf("写入派工演示数据失败: %w", err)
+	}
+
+	// 串联改派链条: 被改派记录指向接收班组的记录, 接收记录回指被改派记录。
+	for index, item := range cases {
+		if item.reassignReason == "" {
+			continue
+		}
+		prevID := records[index].ID
+		nextID := records[index+1].ID
+		if err := db.Model(&dispatch.Dispatch{}).Where("id = ?", prevID).Update("replaced_by_id", nextID).Error; err != nil {
+			return 0, fmt.Errorf("回填派工演示数据失败: %w", err)
+		}
+		if err := db.Model(&dispatch.Dispatch{}).Where("id = ?", nextID).Update("prev_dispatch_id", prevID).Error; err != nil {
+			return 0, fmt.Errorf("回填派工演示数据失败: %w", err)
+		}
+	}
+	return len(records), nil
 }
 
 // buildSeedLamps 生成 6 条道路共 30 盏路灯的台账数据。

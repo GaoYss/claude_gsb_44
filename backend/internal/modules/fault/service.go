@@ -31,15 +31,27 @@ type LampPort interface {
 	UpdateRunStatus(ctx context.Context, id uint, status string) error
 }
 
+// ResolvedListener 由班组派工模块实现, 故障修复或关闭时回调, 用于办结在办派工单。
+type ResolvedListener interface {
+	OnFaultResolved(ctx context.Context, faultID uint) error
+}
+
 // Service 承载故障登记的业务规则, 并向维修模块提供故障状态流转能力。
 type Service struct {
-	repo  *Repository
-	lamps LampPort
+	repo     *Repository
+	lamps    LampPort
+	resolved ResolvedListener
 }
 
 // NewService 构造故障登记服务。
 func NewService(repo *Repository, lamps LampPort) *Service {
 	return &Service{repo: repo, lamps: lamps}
+}
+
+// SetResolvedListener 注入故障闭环监听器。
+// 在 bootstrap 中装配, 以避免故障模块与派工模块之间的构造顺序耦合。
+func (s *Service) SetResolvedListener(listener ResolvedListener) {
+	s.resolved = listener
 }
 
 // Repository 暴露仓储, 供 bootstrap 装配其它模块所需的端口。
@@ -211,6 +223,7 @@ func (s *Service) Close(ctx context.Context, id uint, req CloseRequest) (*Fault,
 	if err := s.syncLampStatus(ctx, entity.LampID); err != nil {
 		slog.Warn("同步路灯运行状态失败", "lamp_id", entity.LampID, "fault_no", entity.FaultNo, "error", err)
 	}
+	s.notifyResolved(ctx, entity.ID)
 	return entity, nil
 }
 
@@ -279,6 +292,7 @@ func (s *Service) OnRepairFinished(ctx context.Context, faultID uint, fixed bool
 		if err := s.repo.Update(ctx, entity); err != nil {
 			return err
 		}
+		s.notifyResolved(ctx, entity.ID)
 	}
 	return s.syncLampStatus(ctx, entity.LampID)
 }
@@ -319,6 +333,16 @@ func (s *Service) syncLampStatus(ctx context.Context, lampID uint) error {
 		status = lamp.RunStatusFault
 	}
 	return s.lamps.UpdateRunStatus(ctx, lampID, status)
+}
+
+// notifyResolved 通知派工模块故障已闭环(修复或关闭), 失败仅记录日志, 不影响主流程。
+func (s *Service) notifyResolved(ctx context.Context, faultID uint) {
+	if s.resolved == nil {
+		return
+	}
+	if err := s.resolved.OnFaultResolved(ctx, faultID); err != nil {
+		slog.Warn("通知派工模块故障闭环失败", "fault_id", faultID, "error", err)
+	}
 }
 
 // buildFilter 将列表查询参数转换为仓储条件, 并解析日期区间。
