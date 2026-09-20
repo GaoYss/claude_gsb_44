@@ -7,6 +7,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"streetlight/internal/modules/dispatch"
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
@@ -142,6 +143,29 @@ func seed(db *gorm.DB) error {
 		}
 	}
 
+	teams := buildSeedTeams()
+	if err := db.Create(&teams).Error; err != nil {
+		return fmt.Errorf("写入班组演示数据失败: %w", err)
+	}
+
+	dispatches, err := buildSeedDispatches(now, faults, teams)
+	if err != nil {
+		return err
+	}
+	if err := db.Create(&dispatches).Error; err != nil {
+		return fmt.Errorf("写入派工演示数据失败: %w", err)
+	}
+	for index, item := range seedDispatchCases() {
+		if item.prevCase >= 0 {
+			prevID := dispatches[item.prevCase].ID
+			if err := db.Model(&dispatch.DispatchRecord{}).
+				Where("id = ?", dispatches[index].ID).
+				Update("prev_record_id", prevID).Error; err != nil {
+				return fmt.Errorf("回填派工改派链路失败: %w", err)
+			}
+		}
+	}
+
 	if err := syncSeedLampStatus(db, faults, lamps); err != nil {
 		return err
 	}
@@ -150,6 +174,8 @@ func seed(db *gorm.DB) error {
 		"路灯", len(lamps),
 		"故障", len(faults),
 		"维修记录", len(repairs),
+		"班组", len(teams),
+		"派工记录", len(dispatches),
 	)
 	return nil
 }
@@ -346,6 +372,118 @@ func seedFaultCases() []seedFaultCase {
 			},
 		},
 	}
+}
+
+// seedDispatchCase 描述一条演示派工记录, 时间字段为距当前时刻的时长。
+type seedDispatchCase struct {
+	faultIndex    int
+	teamIndex     int
+	dispatchedAgo time.Duration
+	status        string
+	finishedAgo   time.Duration // 为 0 表示仍在办
+	fromTeamIndex int           // 改派来源班组下标, -1 表示首次派工
+	prevCase      int           // 上一条派工记录的下标, -1 表示无
+	reason        string
+	operator      string
+}
+
+// buildSeedTeams 生成 3 个班组的演示数据, 覆盖不同的故障类型与负责区域组合。
+func buildSeedTeams() []dispatch.Team {
+	return []dispatch.Team{
+		{
+			Name:        "市政照明一班",
+			MemberCount: 6,
+			FaultTypes:  []string{"灯不亮", "灯光闪烁", "灯具常亮", "控制箱故障"},
+			Areas:       []string{"中山路", "建设大道", "解放路"},
+			Contact:     "刘志强",
+			Phone:       "13900001111",
+			Status:      dispatch.TeamStatusEnabled,
+			Remark:      "负责城东区日常照明设施维修",
+		},
+		{
+			Name:        "市政照明二班",
+			MemberCount: 5,
+			FaultTypes:  []string{"线路故障", "灯具破损", "灯杆倾斜", "其他"},
+			Areas:       []string{"园区北路", "滨江路", "学院路"},
+			Contact:     "周涛",
+			Phone:       "13900002222",
+			Status:      dispatch.TeamStatusEnabled,
+			Remark:      "负责高新区与滨江西片区的线路与结构类故障",
+		},
+		{
+			Name:        "应急抢修班",
+			MemberCount: 4,
+			FaultTypes:  fault.FaultTypes(),
+			Areas:       []string{"中山路", "建设大道", "园区北路", "滨江路", "解放路", "学院路"},
+			Contact:     "赵强",
+			Phone:       "13900003333",
+			Status:      dispatch.TeamStatusEnabled,
+			Remark:      "全类型全区域应急支援, 承接跨区域与紧急工单",
+		},
+	}
+}
+
+// seedDispatchCases 返回演示派工场景, 覆盖在办 / 已改出 / 已办结与超时未完工。
+func seedDispatchCases() []seedDispatchCase {
+	return []seedDispatchCase{
+		{faultIndex: 0, teamIndex: 0, dispatchedAgo: 5 * hour, status: dispatch.StatusOngoing, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+		{faultIndex: 1, teamIndex: 0, dispatchedAgo: 29 * hour, status: dispatch.StatusOngoing, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+		{faultIndex: 2, teamIndex: 2, dispatchedAgo: 39 * hour, status: dispatch.StatusReassigned, finishedAgo: 38 * hour, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+		{faultIndex: 2, teamIndex: 0, dispatchedAgo: 38 * hour, status: dispatch.StatusOngoing, fromTeamIndex: 2, prevCase: 2, reason: "按区域分工调整至责任班组", operator: "调度员王芳"},
+		{faultIndex: 3, teamIndex: 2, dispatchedAgo: 2 * hour, status: dispatch.StatusOngoing, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+		{faultIndex: 4, teamIndex: 0, dispatchedAgo: 1 * hour, status: dispatch.StatusOngoing, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+		{faultIndex: 5, teamIndex: 0, dispatchedAgo: 25 * hour, status: dispatch.StatusFinished, finishedAgo: 20 * hour, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+		{faultIndex: 6, teamIndex: 2, dispatchedAgo: 48 * hour, status: dispatch.StatusFinished, finishedAgo: 44 * hour, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+		{faultIndex: 7, teamIndex: 2, dispatchedAgo: 70 * hour, status: dispatch.StatusFinished, finishedAgo: 60 * hour, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+		{faultIndex: 8, teamIndex: 0, dispatchedAgo: 94 * hour, status: dispatch.StatusFinished, finishedAgo: 90 * hour, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+		{faultIndex: 9, teamIndex: 0, dispatchedAgo: 118 * hour, status: dispatch.StatusFinished, finishedAgo: 112 * hour, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+		{faultIndex: 10, teamIndex: 1, dispatchedAgo: 148 * hour, status: dispatch.StatusFinished, finishedAgo: 140 * hour, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+		{faultIndex: 11, teamIndex: 2, dispatchedAgo: 9 * hour, status: dispatch.StatusFinished, finishedAgo: 7 * hour, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+		{faultIndex: 12, teamIndex: 2, dispatchedAgo: 7 * hour, status: dispatch.StatusOngoing, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+		{faultIndex: 13, teamIndex: 2, dispatchedAgo: 13 * hour, status: dispatch.StatusOngoing, fromTeamIndex: -1, prevCase: -1, operator: "调度员王芳"},
+	}
+}
+
+// buildSeedDispatches 依据演示故障与班组生成派工记录, 单号规则与运行期一致。
+func buildSeedDispatches(now time.Time, faults []fault.Fault, teams []dispatch.Team) ([]dispatch.DispatchRecord, error) {
+	cases := seedDispatchCases()
+	records := make([]dispatch.DispatchRecord, 0, len(cases))
+	sequences := map[string]int{}
+	for _, item := range cases {
+		target := faults[item.faultIndex]
+		team := teams[item.teamIndex]
+		dispatchedAt := now.Add(-item.dispatchedAgo)
+		prefix := "PG" + dispatchedAt.Format("20060102")
+		sequences[prefix]++
+
+		record := dispatch.DispatchRecord{
+			DispatchNo:     fmt.Sprintf("%s%04d", prefix, sequences[prefix]),
+			FaultID:        target.ID,
+			FaultNo:        target.FaultNo,
+			LampID:         target.LampID,
+			LampCode:       target.LampCode,
+			RoadName:       target.RoadName,
+			FaultType:      target.FaultType,
+			FaultLevel:     target.FaultLevel,
+			TeamID:         team.ID,
+			TeamName:       team.Name,
+			Status:         item.status,
+			DispatchedAt:   dispatchedAt,
+			ReassignReason: item.reason,
+			Operator:       item.operator,
+		}
+		if item.finishedAgo > 0 {
+			finishedAt := now.Add(-item.finishedAgo)
+			record.FinishedAt = &finishedAt
+		}
+		if item.fromTeamIndex >= 0 {
+			fromTeam := teams[item.fromTeamIndex]
+			record.FromTeamID = &fromTeam.ID
+			record.FromTeamName = fromTeam.Name
+		}
+		records = append(records, record)
+	}
+	return records, nil
 }
 
 // syncSeedLampStatus 依据演示故障数据回填路灯运行状态, 保证台账与故障一致。

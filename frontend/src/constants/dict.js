@@ -44,6 +44,19 @@ export const REPAIR_RESULT = {
   unfixable: { label: '无法修复', type: 'danger' },
 }
 
+// 班组状态。
+export const TEAM_STATUS = {
+  enabled: { label: '启用', type: 'success' },
+  disabled: { label: '停用', type: 'info' },
+}
+
+// 派工单状态。
+export const DISPATCH_STATUS = {
+  ongoing: { label: '在办', type: 'warning' },
+  reassigned: { label: '已改出', type: 'info' },
+  finished: { label: '已办结', type: 'success' },
+}
+
 // 追踪时间线的节点名称。
 export const TIMELINE_STAGE = {
   reported: { label: '故障登记', type: 'primary' },

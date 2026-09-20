@@ -32,6 +32,18 @@ const routes = [
         meta: { title: '维修记录录入', icon: 'Tools' },
       },
       {
+        path: 'teams',
+        name: 'teams',
+        component: () => import('@/views/team/TeamListView.vue'),
+        meta: { title: '班组管理', icon: 'UserFilled' },
+      },
+      {
+        path: 'dispatches',
+        name: 'dispatches',
+        component: () => import('@/views/dispatch/DispatchListView.vue'),
+        meta: { title: '派工管理', icon: 'Position' },
+      },
+      {
         path: 'status',
         name: 'status',
         component: () => import('@/views/status/StatusLampView.vue'),
